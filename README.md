@@ -1,7 +1,3 @@
-```bash
-curl -fL https://raw.githubusercontent.com/anezuf/RU-Relay-iptables/main/install.sh -o install.sh
-sudo bash install.sh
-```
 # RU Relay — настройка проброса через iptables + UFW
 
 Промежуточный сервер для перенаправления VPN-трафика на зарубежный VPS.
@@ -13,6 +9,13 @@ sudo bash install.sh
 RU Relay не расшифровывает VPN-трафик, а только перенаправляет пакеты через DNAT/SNAT.
 
 > **Требования:** Ubuntu 22.04/24.04, root-доступ, настроенный VPN на EU сервере.
+
+## 0. Установка скриптом
+
+```bash
+curl -fL https://raw.githubusercontent.com/anezuf/RU-Relay-iptables/main/install.sh -o install.sh
+sudo bash install.sh
+```
 
 ---
 
