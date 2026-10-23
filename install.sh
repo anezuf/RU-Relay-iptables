@@ -10,6 +10,25 @@ if [[ ! -r /etc/os-release ]]; then echo 'Unsupported OS' >&2; exit 1; fi
 if [[ ${ID:-} != ubuntu && ${ID:-} != debian ]]; then echo "Unsupported OS: ${ID:-unknown}" >&2; exit 1; fi
 for c in ip awk grep sed date cp mktemp; do command -v "$c" >/dev/null || { echo "Missing: $c" >&2; exit 1; }; done
 
+# Read interactive answers from the controlling terminal, even if stdin is closed.
+# This prevents silent exits under `set -e` when launched from a pipeline.
+if [[ ! -r /dev/tty || ! -w /dev/tty ]] || ! exec 3<>/dev/tty; then
+  echo 'ERROR: An interactive terminal is required.' >&2
+  echo 'Download the script and run it from SSH: sudo bash install.sh' >&2
+  exit 1
+fi
+
+ask() {
+  local prompt=$1 value
+  printf '%s' "$prompt" >&3
+  if ! IFS= read -r -u 3 value; then
+    echo >&2
+    echo 'ERROR: Input was interrupted or terminal was closed.' >&2
+    exit 1
+  fi
+  REPLY=$value
+}
+
 is_ipv4() {
   local ip=$1 part
   [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
@@ -24,7 +43,8 @@ is_ipv4() {
 read_ipv4() {
   local prompt=$1 default=${2:-} value
   while true; do
-    read -r -p "$prompt${default:+ [$default]}: " value
+    ask "$prompt${default:+ [$default]}: "
+    value=$REPLY
     value=${value:-$default}
     if is_ipv4 "$value"; then REPLY=$value; return; fi
     echo 'Enter a valid IPv4 address.'
@@ -34,7 +54,8 @@ read_ipv4() {
 read_ports() {
   local raw token lo hi
   while true; do
-    read -r -p 'Ports (TCP+UDP), comma-separated [443,8443]: ' raw
+    ask 'Ports (TCP+UDP), comma-separated [443,8443]: '
+    raw=$REPLY
     raw=${raw:-443,8443}
     raw=${raw//[[:space:]]/}
     [[ $raw =~ ^[0-9,:-]+$ ]] || { echo 'Invalid characters.'; continue; }
@@ -67,7 +88,8 @@ main() {
   ssh_default=$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)
   ssh_default=${ssh_default:-22}
   while true; do
-    read -r -p "SSH port [$ssh_default]: " ssh_port
+    ask "SSH port [$ssh_default]: "
+    ssh_port=$REPLY
     ssh_port=${ssh_port:-$ssh_default}
     if [[ $ssh_port =~ ^[0-9]{1,5}$ ]] && ((10#$ssh_port >= 1 && 10#$ssh_port <= 65535)); then break; fi
     echo 'Invalid SSH port.'
@@ -79,8 +101,16 @@ main() {
   echo "SSH:   $ssh_port/tcp"
   echo 'The UFW routed policy will be ACCEPT. This is a broad forwarding policy.'
   echo 'Do not use on a host with existing custom NAT/firewall rules without review.'
-  read -r -p 'Apply configuration? Type YES: ' confirm
+  ask 'Apply configuration? Type YES: '
+  local confirm=$REPLY
   [[ $confirm == YES ]] || { echo 'Cancelled.'; exit 0; }
+
+  # Abort before making changes if UFW already contains NAT rules.
+  if [[ -f /etc/ufw/before.rules ]] && grep -Eq '^\*nat([[:space:]]|$)|^# BEGIN RU-RELAY' /etc/ufw/before.rules; then
+    echo 'Existing NAT rules found in /etc/ufw/before.rules.' >&2
+    echo 'No changes made. This installer is intended for first-time setup.' >&2
+    exit 1
+  fi
 
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
@@ -126,7 +156,8 @@ COMMIT
 EOF
   # Validate UFW-managed rules; do not apply via iptables-restore directly.
   if ! iptables-restore --test < /etc/ufw/before.rules; then
-    echo "ERROR: NAT validation failed. Restore /etc/ufw/before.rules from $backup_dir" >&2
+    cp -a "$backup_dir/etc/ufw/before.rules" /etc/ufw/before.rules
+    echo "ERROR: NAT validation failed. Original before.rules restored. Backup: $backup_dir" >&2
     exit 1
   fi
   LC_ALL=C.UTF-8 ufw --force enable
