@@ -1,156 +1,195 @@
-# Настройка RU Relay сервера (iptables)
 
-## Схема
-```
-Клиент → RU сервер (relay) → EU сервер → WARP → Интернет
+# RU Relay — настройка проброса через iptables + UFW
+
+Промежуточный сервер для перенаправления VPN-трафика на зарубежный VPS.
+
+```text
+Клиент → RU Relay → EU Server → WARP → Интернет
 ```
 
-РКН видит только соединение с российским IP. EU сервер и содержимое трафика полностью скрыты — VLESS/Hy2 шифрует всё end-to-end, RU сервер просто пересылает пакеты не расшифровывая их.
+RU Relay не расшифровывает VPN-трафик, а только перенаправляет пакеты через DNAT/SNAT.
+
+> **Требования:** Ubuntu 22.04/24.04, root-доступ, настроенный VPN на EU сервере.
 
 ---
 
-## Шаг 1 — Обновить систему
+## 1. Подготовка
 
-Обновляем пакеты перед началом настройки.
+Установить необходимые пакеты:
 
 ```bash
-apt update && apt upgrade -y
+apt update && apt install -y ufw iptables fail2ban
 ```
 
----
-
-## Шаг 2 — Включить форвардинг пакетов
-
-Разрешает ядру Linux пересылать пакеты между интерфейсами. Без этого relay работать не будет.
+Указать свои IP:
 
 ```bash
-echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-sysctl -p
+RU_IP="45.150.37.207"
+EU_IP="85.155.101.6"
 ```
 
----
-
-## Шаг 3 — Отключить rp_filter (нужно для UDP)
-
-rp_filter проверяет откуда пришёл пакет и может блокировать форвардинг UDP трафика. Сначала проверь значение:
+## 2. Включить IP forwarding
 
 ```bash
-sysctl net.ipv4.conf.all.rp_filter
+echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-ru-relay.conf
+sysctl --system
 ```
 
-Если результат `2` — выполни команды ниже. Если `0` или `1` — пропусти этот шаг.
+## 3. Настроить UFW
+
+Разрешить пересылку пакетов:
 
 ```bash
-sysctl -w net.ipv4.conf.all.rp_filter=0
-sysctl -w net.ipv4.conf.default.rp_filter=0
-echo "net.ipv4.conf.all.rp_filter=0" >> /etc/sysctl.conf
-echo "net.ipv4.conf.default.rp_filter=0" >> /etc/sysctl.conf
+sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
 ```
 
----
-
-## Шаг 4 — Разрешить форвардинг в UFW
-
-По умолчанию UFW блокирует транзитный трафик. Это разрешает пакетам проходить сквозь сервер.
+Разрешить SSH (замени `22`, если используешь другой порт):
 
 ```bash
-sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+ufw allow 22/tcp
 ```
 
----
+> **Важно:** убедись, что SSH разрешён, прежде чем включать UFW. Желательно иметь доступ к консоли VPS.
 
-## Шаг 5 — Открыть порты в UFW
+## 4. Настроить DNAT/SNAT
 
-Открываем порты которые будем пробрасывать на EU сервер.
+Правила сохраняются в `/etc/ufw/before.rules` и загружаются вместе с UFW.
+
+Создать резервную копию:
 
 ```bash
-ufw allow 443/tcp
-ufw allow 443/udp
-ufw allow 8443/tcp
-ufw reload
+cp /etc/ufw/before.rules /etc/ufw/before.rules.bak
 ```
 
----
-
-## Шаг 6 — Настроить проброс портов через before.rules
-
-Записываем правила iptables в `/etc/ufw/before.rules` — они применяются при каждом запуске UFW и переживают любые перезагрузки.
-
-DNAT перенаправляет входящие пакеты на EU сервер. SNAT подменяет обратный адрес на IP RU сервера — без этого EU сервер не знал бы куда отвечать.
-
-> Замени `EU_IP` и `RU_IP` на свои значения
+Добавить NAT-правила:
 
 ```bash
-cat >> /etc/ufw/before.rules << 'EOF'
+cat >> /etc/ufw/before.rules << EOF
 
+# RU Relay NAT
 *nat
 :PREROUTING ACCEPT [0:0]
 :POSTROUTING ACCEPT [0:0]
-# Проброс портов
--A PREROUTING -p tcp -m multiport --dports 443,8443,10000:60000 -j DNAT --to-destination EU_IP
--A PREROUTING -p udp -m multiport --dports 443,8443,10000:60000 -j DNAT --to-destination EU_IP
-# Маскировка под IP RU сервера
--A POSTROUTING -p tcp -d EU_IP -j SNAT --to-source RU_IP
--A POSTROUTING -p udp -d EU_IP -j SNAT --to-source RU_IP
+
+-A PREROUTING -d ${RU_IP} -p tcp -m multiport --dports 443,8443,10000:60000 -j DNAT --to-destination ${EU_IP}
+-A PREROUTING -d ${RU_IP} -p udp -m multiport --dports 443,8443,10000:60000 -j DNAT --to-destination ${EU_IP}
+
+-A POSTROUTING -d ${EU_IP} -p tcp -m conntrack --ctstate DNAT -j SNAT --to-source ${RU_IP}
+-A POSTROUTING -d ${EU_IP} -p udp -m conntrack --ctstate DNAT -j SNAT --to-source ${RU_IP}
+
 COMMIT
 EOF
 ```
 
+> **Порты:** `443`, `8443`, `10000–60000` (TCP/UDP). Оставь только необходимые. Не добавляй второй блок `*nat`, если он уже существует.
+
+## 5. Включить UFW и автозапуск
+
 ```bash
-ufw reload
+LC_ALL=C.UTF-8 ufw --force enable
+systemctl enable ufw
 ```
 
----
-
-## Шаг 7 — Установить Fail2ban
-
-Защищает SSH от брутфорса — автоматически банит IP после нескольких неудачных попыток входа.
+Проверить:
 
 ```bash
-apt install fail2ban -y
+ufw status
+systemctl is-enabled ufw
+grep '^ENABLED=' /etc/ufw/ufw.conf
+```
 
-cat > /etc/fail2ban/jail.local << EOF
-[DEFAULT]
-bantime  = 24h
-findtime = 10m
-maxretry = 5
+Ожидаемый результат:
 
+```text
+Status: active
+enabled
+ENABLED=yes
+```
+
+## 6. Настроить Fail2ban
+
+```bash
+cat > /etc/fail2ban/jail.d/sshd.local << 'EOF'
 [sshd]
 enabled = true
+backend = systemd
+bantime = 24h
+findtime = 10m
+maxretry = 5
 EOF
 
 systemctl enable --now fail2ban
+systemctl restart fail2ban
 ```
 
----
-
-## Шаг 8 — Проверка
+## 7. Проверка
 
 ```bash
-# Правила на месте?
-iptables -t nat -L -n --line-numbers
-
-# Форвардинг включён?
+# IP forwarding
 sysctl net.ipv4.ip_forward
 
-# Мониторинг трафика в реальном времени (пакеты должны расти при использовании VPN)
-watch -n 1 'iptables -t nat -L -n -v | grep DNAT'
+# DNAT / SNAT
+iptables -t nat -L -n -v
+
+# Пересылка пакетов
+iptables -L FORWARD -n -v
+
+# Состояние UFW
+ufw status verbose
+```
+
+Мониторинг подключений:
+
+```bash
+watch -n 1 'iptables -t nat -L -n -v | grep -E "DNAT|SNAT"'
+```
+
+Счётчики правил должны расти при новых VPN-подключениях.
+
+---
+
+## Настройка EU сервера (3x-ui)
+
+**VLESS Reality:** в настройках подключения клиента (например, External Proxy) укажи `RU_IP` вместо адреса EU сервера. Порт и параметры Reality не меняй.
+
+**Hysteria2:** замени адрес сервера в ссылке, сохранив SNI сертификата.
+
+```text
+hysteria2://PASSWORD@RU_IP:443?sni=your-domain.com#Hy2-RU
 ```
 
 ---
 
-## Что нужно отредактировать на EU сервере (3x-ui)
+## VPN перестал работать после перезагрузки?
 
-### VLESS
-В настройках каждого inbound найди поле **External Proxy** и измени адрес с домена/EU IP на **RU IP**. Порт оставь без изменений. После сохранения скопируй ссылку заново — в ней будет RU IP автоматически.
+Проверь UFW:
 
-### Hysteria2
-Hysteria2 настраивается вручную через конфиг. Сформируй ссылку — замени только адрес сервера на RU IP, SNI оставь от домена сертификата:
-
+```bash
+ufw status
 ```
-hy2://user:password@RU_IP:443?sni=твой_домен#Hy2-RU-Relay
+
+Если `inactive`, убедись, что SSH разрешён, затем выполни:
+
+```bash
+LC_ALL=C.UTF-8 ufw --force enable
+```
+
+Проверь восстановление NAT:
+
+```bash
+iptables -t nat -L -n -v
+```
+
+**Для постоянной работы обязательно:**
+
+```text
+UFW:           active
+UFW autostart: enabled
+ENABLED:       yes
+IP forwarding: 1
+DNAT/SNAT:     присутствуют
 ```
 
 ---
 
-> **Важно:** панель 3x-ui, SSH и другие служебные порты — **не пробрасывать**.
+> **Безопасность:** не пробрасывай SSH, панель 3x-ui и другие служебные порты. Учитывай, что при разрешённом forwarding транзитный трафик не ограничивается обычными правилами `ufw allow`.
