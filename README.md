@@ -24,8 +24,8 @@ apt update && apt install -y ufw iptables fail2ban
 Указать свои IP:
 
 ```bash
-RU_IP="45.150.37.207"
-EU_IP="85.155.101.6"
+RU_IP=""
+EU_IP=""
 ```
 
 ## 2. Включить IP forwarding
